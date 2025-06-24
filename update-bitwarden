@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# REQUIRES
+# jq - json parser
+# openssl
+
+# EXIT CODES
+# 0 = Update success or already updated
+# 1 = Requirements not met
+# 2 = `cd` failed
+# 3 = Could not find version information
+# 4 = Download failed
+# 5 = Hashes do not match
+# 6 = Temporary directory is not wriable
+
+# DEFINE VARIABLES
+fileLocation="$1"
+fileName=""
+tempDir=""
+tempDirPre=$(dirname $(realpath "$0"))
+
+version=""
+
+latestUrl=""
+latestFilename=""
+latestVersion=""
+
+latestYmlUrl=""
+latestHash=""
+downloadHash=""
+
+toRemove=()
+
+## String formatting
+F_INFO="\033[2m"
+C_INFO="\033[38;5;8m"
+F_NOTE="\033[1m"
+C_POS="\033[38;5;12m"
+C_NEG="\033[38;5;1m"
+C_DONE="\033[38;5;2m"
+RESET="\033[0m"
+
+function usage() {
+    echo -e "Usage: $0 <Executable BW .AppImage file>\n\nRequires: openssl jq" 1>&2
+    exit 1
+}
+
+function check() {
+    # Check if requirements are met
+    [[ -w "$tempDirPre" ]] || { echo -e "${F_NOTE}${C_NEG}Script location is not writable.\n${RESET}"; exit 6; }
+    [[ -z "$fileLocation" ]] && { echo -e "${F_NOTE}${C_NEG}No file supplied.\n${RESET}"; usage; }
+    fileLocation=$(realpath "$fileLocation")
+    [[ -f "$fileLocation" ]] || { echo -e "${F_NOTE}${C_NEG}File supplied is not a file.\n${RESET}"; usage; }
+    [[ -x "$fileLocation" ]] || { "${F_NOTE}${C_NEG}File supplied is not executable (needed to extract contents).\n${RESET}"; usage; }
+    command -v jq >/dev/null 2>&1 || { "${F_NOTE}${C_NEG}jq is required for script.\n${RESET}"; usage; }
+    command -v openssl >/dev/null 2>&1 || { "${F_NOTE}${C_NEG}openssl is required for script.\n${RESET}"; usage; }
+}
+
+function setReqVars() {
+    fileName=$(basename "$fileLocation")
+    tempDir=$(mktemp -q -d -p "$tempDirPre")
+    [[ -z $tempDir ]] && { echo -e "${F_NOTE}${C_NEG}Could not create temporary directory.\n${RESET}"; usage; }
+}
+
+function extract() {
+    # Extract bitwarden.desktop from .AppImage and get version information
+    cp "$fileLocation" "$tempDir"
+    cd "$tempDir" || { echo "Could not change directory into temporary directory."; exit 2; }
+    echo -e "${F_INFO}${C_INFO}Getting current version..${RESET}"
+    "$tempDir/$fileName" --appimage-extract "bitwarden.desktop" 1>/dev/null 2>&2
+    cd "$tempDir/squashfs-root" || { echo "Could not change into extracted AppImage's directory."; exit 2; }
+    version=$(grep '^X-AppImage-Version=' "bitwarden.desktop" | cut -d '=' -f 2)
+    [[ -z "$version" ]] && { "${F_NOTE}${C_NEG}Could not extract version from AppImage.\n${RESET}"; exit 3; }
+    echo -e "${F_NOTE}${C_POS}Current Version: $version${RESET}"
+}
+
+function getLatestVersion() {
+    # Get latest github releases version
+    echo -e "${F_INFO}${C_INFO}Getting latest version..${RESET}"
+    cd "$tempDir" || { echo "Could not change directory into temporary directory."; exit 2; }
+    curl -s -L "https://api.github.com/repos/bitwarden/clients/releases" -o response.json || { "${F_NOTE}${C_NEG}Could not download releases information.\n${RESET}"; exit 4; }
+    latestUrl=$(jq -r '.[] | .assets[] | select(.name | endswith(".AppImage")) | .browser_download_url' response.json | head -n 1)
+    latestFilename="${latestUrl##*/}"
+    latestVersion=$(echo "$latestFilename" | cut -d '-' -f 2)
+    echo -e "${F_NOTE}${C_POS}Latest Version: $latestVersion${RESET}"
+}
+
+function checkTwo() {
+    # Check if version matches or not
+    if [[ "$version" = "$latestVersion" ]]; then
+        echo -e "${F_NOTE}${C_DONE}You've got the latest version!${RESET}"
+        exit 0
+    fi
+}
+
+function getLatestAppImage() {
+    cd "$tempDir" || { echo "Could not change directory into temporary directory."; exit 2; }
+    echo "Downloading latest version.."
+    curl -s -L "$latestUrl" -o "$latestFilename" || { "${F_NOTE}${C_NEG}Could not download latest version.\n${RESET}"; exit 4; }
+}
+
+function getLatestHash() {
+    # Verify latest version
+    echo -e "${F_INFO}${C_INFO}Verifying hash of latest version..${RESET}"
+    latestYmlUrl=$(jq -r '.[] | .assets[] | select(.name | endswith("latest-linux.yml")) | .browser_download_url' response.json | head -n 1)
+    curl -s -L "$latestYmlUrl" -o response2.yml || { "${F_NOTE}${C_NEG}Could not download release hash.\n${RESET}"; exit 4; }
+    latestHash=$(grep -A 1 "url: $latestFilename" response2.yml | grep sha512 | awk -F': ' '{print $2}')
+    echo -e "${F_NOTE}${C_POS}Hash: $latestHash${RESET}"
+    downloadHash=$(openssl dgst -sha512 -binary "$latestFilename" | base64 -w 0)
+}
+
+function checkThree() {
+    if [[ "$latestHash" != "$downloadHash" ]]; then
+        echo -e "${F_NOTE}${C_NEG}Hashes DO NOT match between downloaded file and Bitwarden published hashes.${RESET}"
+        exit 5
+    fi
+}
+
+function rewriteOldFile() {
+    mv "$fileLocation" "$fileLocation.old"
+    mv "$tempDir/$latestFilename" "$fileLocation"
+}
+
+function trapCleanup() {
+    echo ""
+    if [[ -d "$tempDir" ]]; then
+        echo -e "${F_INFO}${C_INFO}Cleaning up temporary directory: $tempDir${RESET}"
+        rm -r "$tempDir"
+    fi
+}
+
+function main() {
+    check
+    setReqVars
+    trap trapCleanup EXIT
+    extract
+    getLatestVersion
+    checkTwo
+    getLatestAppImage
+    getLatestHash
+    checkThree
+    rewriteOldFile
+    trap - EXIT
+}
+main
